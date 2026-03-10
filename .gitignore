@@ -1,0 +1,8 @@
+/.idea/
+/.temp/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.DS_Store
