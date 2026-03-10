@@ -38,7 +38,9 @@ Example output:
 === Runtime Profile ===
 profile: demo
 embed_dim=8, context_len=8, hidden_dim=16
-epochs=180, batch_size=4, lr=0.03
+epochs=180, batch_size=8, lr=0.01
+optimizer=adam
+generation=top_k, temperature=0.55, top_k=4, no_repeat_ngram=5
 seed=3
 
 === Training ===
@@ -80,10 +82,15 @@ You can override the runtime settings with environment variables.
 | `TINY_LLM_RUNTIME_EMBED_DIM` | `8` | Embedding dimension for demo runs |
 | `TINY_LLM_RUNTIME_CONTEXT_LEN` | `8` | Context length for demo runs |
 | `TINY_LLM_RUNTIME_HIDDEN_DIM` | `16` | FFN hidden dimension for demo runs |
-| `TINY_LLM_RUNTIME_LR` | `0.03` | Learning rate |
+| `TINY_LLM_RUNTIME_LR` | `0.01` | Learning rate |
 | `TINY_LLM_RUNTIME_EPOCHS` | `180` | Number of epochs |
-| `TINY_LLM_RUNTIME_BATCH_SIZE` | `4` | Batch size |
+| `TINY_LLM_RUNTIME_BATCH_SIZE` | `8` | Batch size |
+| `TINY_LLM_OPTIMIZER` | `adam` | `adam` or `sgd` |
 | `TINY_LLM_SEED` | `3` | Random seed |
+| `TINY_LLM_GENERATION_TEMPERATURE` | `0.55` | Sampling temperature during generation |
+| `TINY_LLM_GENERATION_STRATEGY` | `top_k` | `greedy`, `sample`, or `top_k` |
+| `TINY_LLM_GENERATION_TOP_K` | `4` | Candidate count used by `top_k` generation |
+| `TINY_LLM_NO_REPEAT_NGRAM` | `5` | Blocks exact local n-gram loops during generation; `0` disables it |
 
 Examples:
 
@@ -93,6 +100,14 @@ env TINY_LLM_RUNTIME_EPOCHS=300 TINY_LLM_RUNTIME_LR=0.02 ruby tiny_llm.rb
 
 ```bash
 env TINY_LLM_SEED=11 TINY_LLM_RUNTIME_BATCH_SIZE=8 ruby tiny_llm.rb
+```
+
+```bash
+env TINY_LLM_OPTIMIZER=sgd TINY_LLM_GENERATION_STRATEGY=greedy ruby tiny_llm.rb
+```
+
+```bash
+env TINY_LLM_NO_REPEAT_NGRAM=0 TINY_LLM_RUNTIME_BATCH_SIZE=4 ruby tiny_llm.rb
 ```
 
 ## What Is Implemented
@@ -106,8 +121,8 @@ env TINY_LLM_SEED=11 TINY_LLM_RUNTIME_BATCH_SIZE=8 ruby tiny_llm.rb
 - `TransformerBlock`
 - `TinyLLM`
 - cross-entropy loss
-- SGD training
-- temperature-based sampling for generation
+- Adam / SGD training
+- greedy / sampling / top-k generation
 
 ## Changing the Training Data
 
@@ -138,7 +153,8 @@ If you want to understand the implementation, this order is the easiest:
 - This is not a production model
 - The tokenizer is character-level
 - Attention is single-head
-- Optimization uses SGD
+- The default optimizer is Adam, but the model is still tiny
+- The demo profile favors cleaner output over raw speed
 - Autograd is scalar-based, not tensor-based
 - Training is slow because of that
 

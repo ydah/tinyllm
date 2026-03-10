@@ -14,6 +14,11 @@ BATCH_SIZE = 16
 # Numerical safety values used throughout the implementation.
 EPSILON = 1e-5
 LOG_EPSILON = 1e-10
+ADAM_BETA1 = 0.9
+ADAM_BETA2 = 0.999
+ADAM_EPSILON = 1e-8
+OPTIMIZERS = %w[adam sgd].freeze
+GENERATION_STRATEGIES = %w[greedy sample top_k].freeze
 
 # -----------------------------------------------------------------------------
 # Runtime profile
@@ -35,15 +40,32 @@ RUNTIME_HIDDEN_DIM = Integer(
   ENV.fetch("TINY_LLM_RUNTIME_HIDDEN_DIM", FULL_PROFILE ? HIDDEN_DIM.to_s : "16")
 )
 RUNTIME_LEARNING_RATE = Float(
-  ENV.fetch("TINY_LLM_RUNTIME_LR", FULL_PROFILE ? LEARNING_RATE.to_s : "0.03")
+  ENV.fetch("TINY_LLM_RUNTIME_LR", FULL_PROFILE ? LEARNING_RATE.to_s : "0.01")
 )
 RUNTIME_EPOCHS = Integer(
   ENV.fetch("TINY_LLM_RUNTIME_EPOCHS", FULL_PROFILE ? EPOCHS.to_s : "180")
 )
 RUNTIME_BATCH_SIZE = Integer(
-  ENV.fetch("TINY_LLM_RUNTIME_BATCH_SIZE", FULL_PROFILE ? BATCH_SIZE.to_s : "4")
+  ENV.fetch("TINY_LLM_RUNTIME_BATCH_SIZE", FULL_PROFILE ? BATCH_SIZE.to_s : "8")
 )
+RUNTIME_OPTIMIZER = ENV.fetch("TINY_LLM_OPTIMIZER", "adam")
 RUNTIME_SEED = Integer(ENV.fetch("TINY_LLM_SEED", "3"))
+RUNTIME_GENERATION_TEMPERATURE = Float(
+  ENV.fetch("TINY_LLM_GENERATION_TEMPERATURE", FULL_PROFILE ? "0.7" : "0.55")
+)
+RUNTIME_GENERATION_STRATEGY = ENV.fetch("TINY_LLM_GENERATION_STRATEGY", "top_k")
+RUNTIME_GENERATION_TOP_K = Integer(
+  ENV.fetch("TINY_LLM_GENERATION_TOP_K", FULL_PROFILE ? "5" : "4")
+)
+RUNTIME_NO_REPEAT_NGRAM = Integer(
+  ENV.fetch("TINY_LLM_NO_REPEAT_NGRAM", FULL_PROFILE ? "6" : "5")
+)
+
+raise ArgumentError, "Unknown optimizer: #{RUNTIME_OPTIMIZER}" unless OPTIMIZERS.include?(RUNTIME_OPTIMIZER)
+unless GENERATION_STRATEGIES.include?(RUNTIME_GENERATION_STRATEGY)
+  raise ArgumentError, "Unknown generation strategy: #{RUNTIME_GENERATION_STRATEGY}"
+end
+raise ArgumentError, "No-repeat ngram must be non-negative" if RUNTIME_NO_REPEAT_NGRAM.negative?
 
 srand(RUNTIME_SEED)
 
@@ -285,6 +307,13 @@ def softmax(logits)
   exp_values.map { |value| value / sum_exp }
 end
 
+def softmax_values(values)
+  max_value = values.max
+  exp_values = values.map { |value| Math.exp(value - max_value) }
+  sum_exp = exp_values.sum
+  exp_values.map { |value| value / sum_exp }
+end
+
 def average_tensor(values)
   raise ArgumentError, "Cannot average an empty array" if values.empty?
 
@@ -293,6 +322,48 @@ end
 
 def shape_of(matrix)
   [matrix.length, matrix.empty? ? 0 : matrix.first.length]
+end
+
+def argmax_index(values)
+  values.each_with_index.max_by { |value, index| [value, -index] }.last
+end
+
+def mask_top_k_values(values, top_k)
+  top_k = [[top_k, 1].max, values.length].min
+  kept_indices = values.each_with_index
+                       .sort_by { |value, index| [-value, index] }
+                       .first(top_k)
+                       .map(&:last)
+  kept_lookup = kept_indices.to_h { |index| [index, true] }
+
+  values.each_with_index.map do |value, index|
+    kept_lookup[index] ? value : -Float::INFINITY
+  end
+end
+
+def blocked_token_ids_for_no_repeat_ngram(tokens, ngram_size)
+  return [] if ngram_size < 2 || tokens.length < (ngram_size - 1)
+
+  prefix = tokens.last(ngram_size - 1)
+  blocked = []
+
+  0.upto(tokens.length - ngram_size) do |index|
+    blocked << tokens[index + ngram_size - 1] if tokens[index, ngram_size - 1] == prefix
+  end
+
+  blocked.uniq
+end
+
+def apply_no_repeat_ngram(values, tokens, ngram_size)
+  blocked_ids = blocked_token_ids_for_no_repeat_ngram(tokens, ngram_size)
+  return values if blocked_ids.empty?
+
+  blocked_lookup = blocked_ids.to_h { |token_id| [token_id, true] }
+  filtered_values = values.each_with_index.map do |value, token_id|
+    blocked_lookup[token_id] ? -Float::INFINITY : value
+  end
+
+  filtered_values.all? { |value| !value.finite? } ? values : filtered_values
 end
 
 class Embedding
@@ -518,6 +589,17 @@ def run_shape_sanity_checks!(tokenizer)
   assert_shape!(logits, [3, tokenizer.vocab_size], "TinyLLM logits")
 end
 
+def run_generation_sanity_checks!
+  logits = [Tensor.scalar(0.1), Tensor.scalar(0.9), Tensor.scalar(0.2)]
+  greedy_choice = choose_next_token(logits, strategy: "greedy", temperature: 0.6, top_k: 2)
+  top_k_choice = choose_next_token(logits, strategy: "top_k", temperature: 0.6, top_k: 1)
+  blocked = blocked_token_ids_for_no_repeat_ngram([0, 1, 2, 1, 2], 3)
+
+  raise "Greedy decoding mismatch" unless greedy_choice == 1
+  raise "Top-k decoding mismatch" unless top_k_choice == 1
+  raise "No-repeat ngram mismatch" unless blocked == [1]
+end
+
 def build_training_examples(tokens, context_len)
   max_start = tokens.length - context_len - 1
   raise ArgumentError, "Training data is too short for context length #{context_len}" if max_start.negative?
@@ -538,10 +620,53 @@ def cross_entropy_loss(logits, targets)
   average_tensor(losses)
 end
 
-def train(model, data, tokenizer, epochs, lr, batch_size)
+def build_optimizer_state(params, optimizer_name)
+  case optimizer_name
+  when "sgd"
+    { name: "sgd" }
+  when "adam"
+    {
+      name: "adam",
+      m: Array.new(params.length, 0.0),
+      v: Array.new(params.length, 0.0)
+    }
+  else
+    raise ArgumentError, "Unknown optimizer: #{optimizer_name}"
+  end
+end
+
+def apply_optimizer_step!(params, lr, optimizer_state, step)
+  case optimizer_state[:name]
+  when "sgd"
+    params.each do |param|
+      param.value -= lr * param.grad
+      param.zero_grad!
+    end
+  when "adam"
+    bias_correction1 = 1.0 - (ADAM_BETA1**step)
+    bias_correction2 = 1.0 - (ADAM_BETA2**step)
+
+    params.each_with_index do |param, index|
+      grad = param.grad
+      optimizer_state[:m][index] = (ADAM_BETA1 * optimizer_state[:m][index]) + ((1.0 - ADAM_BETA1) * grad)
+      optimizer_state[:v][index] = (ADAM_BETA2 * optimizer_state[:v][index]) + ((1.0 - ADAM_BETA2) * grad * grad)
+
+      m_hat = optimizer_state[:m][index] / bias_correction1
+      v_hat = optimizer_state[:v][index] / bias_correction2
+
+      param.value -= lr * m_hat / (Math.sqrt(v_hat) + ADAM_EPSILON)
+      param.zero_grad!
+    end
+  else
+    raise ArgumentError, "Unknown optimizer state: #{optimizer_state[:name]}"
+  end
+end
+
+def train(model, data, tokenizer, epochs, lr, batch_size, optimizer_name)
   tokens = tokenizer.encode(data)
   examples = build_training_examples(tokens, model.context_len)
   all_params = model.params
+  optimizer_state = build_optimizer_state(all_params, optimizer_name)
   report_interval = FULL_PROFILE ? 50 : [epochs / 6, 1].max
   loss_history = []
   best_loss = Float::INFINITY
@@ -563,10 +688,7 @@ def train(model, data, tokenizer, epochs, lr, batch_size)
       best_values = current_values
     end
 
-    all_params.each do |param|
-      param.value -= lr * param.grad
-      param.zero_grad!
-    end
+    apply_optimizer_step!(all_params, lr, optimizer_state, epoch + 1)
 
     loss_history << batch_loss.value
     epoch_number = epoch + 1
@@ -596,16 +718,41 @@ def sample_from_probs(probabilities)
   probabilities.length - 1
 end
 
-def generate(model, tokenizer, seed_text, length, temperature = 1.0)
+def choose_next_token(logits, strategy:, temperature:, top_k:, recent_tokens: [], no_repeat_ngram: 0)
+  values = logits.map(&:value)
+
+  case strategy
+  when "greedy"
+    argmax_index(apply_no_repeat_ngram(values, recent_tokens, no_repeat_ngram))
+  when "sample"
+    scaled_values = values.map { |value| value / temperature }
+    guarded_values = apply_no_repeat_ngram(scaled_values, recent_tokens, no_repeat_ngram)
+    sample_from_probs(softmax_values(guarded_values))
+  when "top_k"
+    scaled_values = values.map { |value| value / temperature }
+    guarded_values = apply_no_repeat_ngram(scaled_values, recent_tokens, no_repeat_ngram)
+    filtered_values = mask_top_k_values(guarded_values, top_k)
+    sample_from_probs(softmax_values(filtered_values))
+  else
+    raise ArgumentError, "Unknown generation strategy: #{strategy}"
+  end
+end
+
+def generate(model, tokenizer, seed_text, length, temperature: 1.0, strategy: "sample", top_k: 5, no_repeat_ngram: 0)
   temperature = [temperature, 0.1].max
   tokens = tokenizer.encode(seed_text)
 
   length.times do
     context_tokens = tokens.last(model.context_len)
     logits = model.forward(context_tokens)
-    scaled_logits = logits.last.map { |logit| logit / temperature }
-    probabilities = softmax(scaled_logits).map(&:value)
-    tokens << sample_from_probs(probabilities)
+    tokens << choose_next_token(
+      logits.last,
+      strategy: strategy,
+      temperature: temperature,
+      top_k: top_k,
+      recent_tokens: tokens,
+      no_repeat_ngram: no_repeat_ngram
+    )
   end
 
   tokenizer.decode(tokens)
@@ -616,6 +763,8 @@ def print_runtime_profile
   puts "profile: #{FULL_PROFILE ? 'full' : 'demo'}"
   puts "embed_dim=#{RUNTIME_EMBED_DIM}, context_len=#{RUNTIME_CONTEXT_LEN}, hidden_dim=#{RUNTIME_HIDDEN_DIM}"
   puts "epochs=#{RUNTIME_EPOCHS}, batch_size=#{RUNTIME_BATCH_SIZE}, lr=#{RUNTIME_LEARNING_RATE}"
+  puts "optimizer=#{RUNTIME_OPTIMIZER}"
+  puts "generation=#{RUNTIME_GENERATION_STRATEGY}, temperature=#{RUNTIME_GENERATION_TEMPERATURE}, top_k=#{RUNTIME_GENERATION_TOP_K}, no_repeat_ngram=#{RUNTIME_NO_REPEAT_NGRAM}"
   puts "seed=#{RUNTIME_SEED}"
   puts
 end
@@ -637,6 +786,7 @@ if __FILE__ == $PROGRAM_NAME
   run_tokenizer_sanity_check!
   tokenizer = Tokenizer.new(TRAIN_DATA)
   run_shape_sanity_checks!(tokenizer)
+  run_generation_sanity_checks!
 
   model = TinyLLM.new(
     tokenizer.vocab_size,
@@ -655,11 +805,21 @@ if __FILE__ == $PROGRAM_NAME
     tokenizer,
     RUNTIME_EPOCHS,
     RUNTIME_LEARNING_RATE,
-    RUNTIME_BATCH_SIZE
+    RUNTIME_BATCH_SIZE,
+    RUNTIME_OPTIMIZER
   )
   puts "Final loss: #{format('%0.4f', training_result[:history].last)}"
   puts "Best loss:  #{format('%0.4f', training_result[:best_loss])}"
   puts
   puts "=== Generation ==="
-  puts generate(model, tokenizer, "To be", 100, 0.8)
+  puts generate(
+    model,
+    tokenizer,
+    "To be",
+    100,
+    temperature: RUNTIME_GENERATION_TEMPERATURE,
+    strategy: RUNTIME_GENERATION_STRATEGY,
+    top_k: RUNTIME_GENERATION_TOP_K,
+    no_repeat_ngram: RUNTIME_NO_REPEAT_NGRAM
+  )
 end
